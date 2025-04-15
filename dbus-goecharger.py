@@ -3,6 +3,7 @@
 # import normal packages
 import platform 
 import logging
+from logging.handlers import RotatingFileHandler
 import sys
 import os
 import sys
@@ -25,8 +26,13 @@ class DbusGoeChargerService:
     config = self._getConfig()
     deviceinstance = int(config['DEFAULT']['Deviceinstance'])
     hardwareVersion = int(config['DEFAULT']['HardwareVersion'])
+    acPosition = int(config['DEFAULT']['AcPosition'])
+    pauseBetweenRequests = int(config['ONPREMISE']['PauseBetweenRequests']) # in ms
 
-    self._dbusservice = VeDbusService("{}.http_{:02d}".format(servicename, deviceinstance))
+    if pauseBetweenRequests <= 20:
+      raise ValueError("Pause between requests must be greater than 20")
+
+    self._dbusservice = VeDbusService("{}.http_{:02d}".format(servicename, deviceinstance), register=False)
     self._paths = paths
     
     logging.debug("%s /DeviceInstance = %d" % (servicename, deviceinstance))
@@ -37,7 +43,7 @@ class DbusGoeChargerService:
     ]
     
     #get data from go-eCharger
-    data = self._getGoeChargerData()
+    data = self._getGoeChargerData('sse,fwv')
 
     # Create the management objects, as specified in the ccgx dbus-api document
     self._dbusservice.add_path('/Mgmt/ProcessName', __file__)
@@ -49,11 +55,18 @@ class DbusGoeChargerService:
     self._dbusservice.add_path('/ProductId', 0xFFFF) # 
     self._dbusservice.add_path('/ProductName', productname)
     self._dbusservice.add_path('/CustomName', productname)    
-    self._dbusservice.add_path('/FirmwareVersion', int(data['fwv'].replace('.', '')))
+    if data:
+       fwv = data['fwv']
+       try:
+           fwv = int(data['fwv'].replace('.', ''))
+       except:
+           pass
+       self._dbusservice.add_path('/FirmwareVersion', fwv)
+       self._dbusservice.add_path('/Serial', data['sse'])
     self._dbusservice.add_path('/HardwareVersion', hardwareVersion)
-    self._dbusservice.add_path('/Serial', data['sse'])
     self._dbusservice.add_path('/Connected', 1)
     self._dbusservice.add_path('/UpdateIndex', 0)
+    self._dbusservice.add_path('/Position', acPosition)
     
     # add paths without units
     for path in paths_wo_unit:
@@ -64,6 +77,9 @@ class DbusGoeChargerService:
       self._dbusservice.add_path(
         path, settings['initial'], gettextcallback=settings['textformat'], writeable=True, onchangecallback=self._handlechangedvalue)
 
+    # register the service
+    self._dbusservice.register()
+
     # last update
     self._lastUpdate = 0
     
@@ -71,7 +87,7 @@ class DbusGoeChargerService:
     self._chargingTime = 0.0
 
     # add _update function 'timer'
-    gobject.timeout_add(250, self._update) # pause 250ms before the next request
+    gobject.timeout_add(pauseBetweenRequests, self._update)
     
     # add _signOfLife 'timer' to get feedback in log every 5minutes
     gobject.timeout_add(self._getSignOfLifeInterval()*60*1000, self._signOfLife)
@@ -97,9 +113,9 @@ class DbusGoeChargerService:
     accessType = config['DEFAULT']['AccessType']
     
     if accessType == 'OnPremise': 
-        URL = "http://%s/status" % (config['ONPREMISE']['Host'])
+      URL = "http://%s/api/status" % (config['ONPREMISE']['Host'])
     else:
-        raise ValueError("AccessType %s is not supported" % (config['DEFAULT']['AccessType']))
+      raise ValueError("AccessType %s is not supported" % (config['DEFAULT']['AccessType']))
     
     return URL
   
@@ -135,9 +151,12 @@ class DbusGoeChargerService:
       return False
     
  
-  def _getGoeChargerData(self):
-    URL = self._getGoeChargerStatusUrl()
-    request_data = requests.get(url = URL)
+  def _getGoeChargerData(self, filter):
+    URL = "%s?filter=%s" % (self._getGoeChargerStatusUrl(), filter)
+    try:
+       request_data = requests.get(url = URL, timeout=1)
+    except Exception:
+       return None
     
     # check for response
     if not request_data:
@@ -163,63 +182,95 @@ class DbusGoeChargerService:
   def _update(self):   
     try:
        #get data from go-eCharger
-       data = self._getGoeChargerData()
+       data = self._getGoeChargerData('nrg,eto,wh,alw,amp,ama,car,tmp,tma')
        
-       #send data to DBus
-       self._dbusservice['/Ac/L1/Power'] = int(data['nrg'][7] * 0.1 * 1000)
-       self._dbusservice['/Ac/L2/Power'] = int(data['nrg'][8] * 0.1 * 1000)
-       self._dbusservice['/Ac/L3/Power'] = int(data['nrg'][9] * 0.1 * 1000)
-       self._dbusservice['/Ac/Power'] = int(data['nrg'][11] * 0.01 * 1000)
-       self._dbusservice['/Ac/Voltage'] = int(data['nrg'][0])
-       self._dbusservice['/Current'] = max(data['nrg'][4] * 0.1, data['nrg'][5] * 0.1, data['nrg'][6] * 0.1)
-       self._dbusservice['/Ac/Energy/Forward'] = int(float(data['eto']) / 10.0)
-       
-       self._dbusservice['/StartStop'] = int(data['alw'])
-       self._dbusservice['/SetCurrent'] = int(data['amp'])
-       self._dbusservice['/MaxCurrent'] = int(data['ama']) 
-       
-       # update chargingTime, increment charge time only on active charging (2), reset when no car connected (1)
-       timeDelta = time.time() - self._lastUpdate
-       if int(data['car']) == 2 and self._lastUpdate > 0:  # vehicle loads
-         self._chargingTime += timeDelta
-       elif int(data['car']) == 1:  # charging station ready, no vehicle
-         self._chargingTime = 0
-       self._dbusservice['/ChargingTime'] = int(self._chargingTime)
+       if data is not None:
 
-       self._dbusservice['/Mode'] = 0  # Manual, no control
-       
-       config = self._getConfig()
-       hardwareVersion = int(config['DEFAULT']['HardwareVersion'])
-       if hardwareVersion == 3:
-         self._dbusservice['/MCU/Temperature'] = int(data['tma'][0])
+          '''
+          data['nrg']
+          0 = U L1
+          1 = U L2
+          2 = U L3
+          3 = U N
+          4 = I L1
+          5 = I L2
+          6 = I L3
+          7 = P L1
+          8 = P L2
+          9 = P L3
+          10 = P N
+          11 = P Total
+          12 = PF L1
+          13 = PF L2
+          14 = PF L3
+          15 = PF N
+          '''
+          config = self._getConfig()
+          hardwareVersion = int(config['DEFAULT']['HardwareVersion'])
+
+          #send data to DBus
+          self._dbusservice['/Ac/Voltage'] = int(data['nrg'][0])
+          self._dbusservice['/Ac/L1/Power'] = int(data['nrg'][7])
+          self._dbusservice['/Ac/L2/Power'] = int(data['nrg'][8])
+          self._dbusservice['/Ac/L3/Power'] = int(data['nrg'][9])
+          self._dbusservice['/Ac/Power'] = int(data['nrg'][11])
+          self._dbusservice['/Current'] = max(data['nrg'][4], data['nrg'][5], data['nrg'][6])
+          if int(hardwareVersion) < 4: 
+            self._dbusservice['/Ac/Energy/Forward'] = int(float(data['eto']) / 1000.0)
+          else:
+            self._dbusservice['/Ac/Energy/Forward'] = round(data['wh'] / 1000, 2)
+          
+          self._dbusservice['/StartStop'] = int(data['alw'])
+          self._dbusservice['/SetCurrent'] = int(data['amp'])
+          self._dbusservice['/MaxCurrent'] = int(data['ama']) 
+
+          # update chargingTime, increment charge time only on active charging (2), reset when no car connected (1)
+          timeDelta = time.time() - self._lastUpdate
+          if int(data['car']) == 2 and self._lastUpdate > 0:  # vehicle loads
+            self._chargingTime += timeDelta
+          elif int(data['car']) == 1:  # charging station ready, no vehicle
+            self._chargingTime = 0
+          self._dbusservice['/ChargingTime'] = int(self._chargingTime)
+
+          self._dbusservice['/Mode'] = 0  # Manual, no control
+          
+          config = self._getConfig()
+          hardwareVersion = int(config['DEFAULT']['HardwareVersion'])
+          if '/MCU/Temperature' in self._dbusservice: # check if path exists, at some point it was removed
+             if hardwareVersion >= 3:
+                self._dbusservice['/MCU/Temperature'] = int(data['tma'][0] if data['tma'][0] else 0)
+             else:
+                self._dbusservice['/MCU/Temperature'] = int(data['tmp'])
+
+          # carState, null if internal error (Unknown/Error=0, Idle=1, Charging=2, WaitCar=3, Complete=4, Error=5)
+          # status 0=Disconnected; 1=Connected; 2=Charging; 3=Charged; 4=Waiting for sun; 5=Waiting for RFID; 6=Waiting for start; 7=Low SOC; 8=Ground fault; 9=Welded contacts; 10=CP Input shorted; 11=Residual current detected; 12=Under voltage detected; 13=Overvoltage detected; 14=Overheating detected
+          status = 0
+          if int(data['car']) == 1:
+            status = 0
+          elif int(data['car']) == 2:
+            status = 2
+          elif int(data['car']) == 3:
+            status = 6
+          elif int(data['car']) == 4:
+            status = 3
+          self._dbusservice['/Status'] = status
+
+          #logging
+          logging.debug("Wallbox Consumption (/Ac/Power): %s" % (self._dbusservice['/Ac/Power']))
+          logging.debug("Wallbox Forward (/Ac/Energy/Forward): %s" % (self._dbusservice['/Ac/Energy/Forward']))
+          logging.debug("---")
+          
+          # increment UpdateIndex - to show that new data is available
+          index = self._dbusservice['/UpdateIndex'] + 1  # increment index
+          if index > 255:   # maximum value of the index
+            index = 0       # overflow from 255 to 0
+          self._dbusservice['/UpdateIndex'] = index
+
+          #update lastupdate vars
+          self._lastUpdate = time.time()  
        else:
-         self._dbusservice['/MCU/Temperature'] = int(data['tmp'])
+          logging.debug("Wallbox is not available")
 
-       # value 'car' 1: charging station ready, no vehicle 2: vehicle loads 3: Waiting for vehicle 4: Charge finished, vehicle still connected
-       status = 0
-       if int(data['car']) == 1:
-         status = 0
-       elif int(data['car']) == 2:
-         status = 2
-       elif int(data['car']) == 3:
-         status = 6
-       elif int(data['car']) == 4:
-         status = 3
-       self._dbusservice['/Status'] = status
-
-       #logging
-       logging.debug("Wallbox Consumption (/Ac/Power): %s" % (self._dbusservice['/Ac/Power']))
-       logging.debug("Wallbox Forward (/Ac/Energy/Forward): %s" % (self._dbusservice['/Ac/Energy/Forward']))
-       logging.debug("---")
-       
-       # increment UpdateIndex - to show that new data is available
-       index = self._dbusservice['/UpdateIndex'] + 1  # increment index
-       if index > 255:   # maximum value of the index
-         index = 0       # overflow from 255 to 0
-       self._dbusservice['/UpdateIndex'] = index
-
-       #update lastupdate vars
-       self._lastUpdate = time.time()              
     except Exception as e:
        logging.critical('Error at %s', '_update', exc_info=e)
        
@@ -242,11 +293,15 @@ class DbusGoeChargerService:
 
 def main():
   #configure logging
+  config = configparser.ConfigParser()
+  config.read(f"{(os.path.dirname(os.path.realpath(__file__)))}/config.ini")
+  logging_level = config["DEFAULT"]["Logging"].upper()
+
   logging.basicConfig(      format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
                             datefmt='%Y-%m-%d %H:%M:%S',
-                            level=logging.INFO,
+                            level=logging_level,
                             handlers=[
-                                logging.FileHandler("%s/current.log" % (os.path.dirname(os.path.realpath(__file__)))),
+                                RotatingFileHandler("%s/current.log" % (os.path.dirname(os.path.realpath(__file__))), maxBytes=10000),
                                 logging.StreamHandler()
                             ])
  
